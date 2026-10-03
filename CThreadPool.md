@@ -1,6 +1,5 @@
-# CThreadPool 线程池学习笔记
-
-> 本文基于当前 `ZERO1206/ThreadPool` 仓库 `main` 分支中的源码整理。  
+# CThreadPool 线程池
+ 
 > 主要学习目标：理解线程池的组成、任务队列、Worker、Manager，以及线程池动态扩缩容的整体工作过程。
 
 ---
@@ -19,7 +18,6 @@ ThreadPool/
 
 | 文件 | 作用 |
 |---|---|
-| `.gitignore` | 指定不需要提交到 Git 的文件 |
 | `CThreadPool.h` | 对外提供线程池接口 |
 | `CThreadPool.c` | 线程池核心实现 |
 | `main.c` | 创建线程池并提交测试任务 |
