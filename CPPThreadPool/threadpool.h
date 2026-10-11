@@ -9,6 +9,8 @@
 #include <condition_variable>
 #include <functional>
 
+class Result;
+
 // Any类型: 可以接收任意数据的类型
 class Any
 {
@@ -62,12 +64,75 @@ private:
     std::unique_ptr<Base> base_;
 };
 
+// 实现一个信号量类
+class Semaphore
+{
+public:
+    Semaphore(int limit = 0) : resLimit_()
+    {}
+
+    ~Semaphore() = default;
+
+    // 获取一个信号量资源
+    void wait()
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        // 等待信号量有资源 没有资源的话 会阻塞当前线程
+        cond_.wait(lock, [&]() -> bool { return resLimit_ > 0; });
+        resLimit_--;
+    }
+
+    // 增加一个信号量资源
+    void post()
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        resLimit_++;
+        cond_.notify_all();
+    }
+private:
+    size_t resLimit_;
+    std::mutex mtx_;
+    std::condition_variable cond_;
+};
+
 // 任务抽象基类
 class Task
 {
 public:
+    Task();
+
+    ~Task() = default;
+
+    void exec();
+
+    void setResult(Result* res);
+
     // 用户可以自定义任意任务类型，从Task继承，重写run方法，实现自定义任务处理
     virtual Any run() = 0;
+
+private:
+    Result* result_;    // Result对象的生存周期 >>> Task
+};
+
+// 实现接收提交到线程池的task任务执行完后的返回值类型Result
+class Result
+{
+public:
+    Result(std::shared_ptr<Task> task, bool isValid = true);
+
+    ~Result() = default;
+
+    // No1.setVal方法 获取任务执行完的返回值
+    void setVal(Any any);
+
+    // No2.get方法 用户调用这个方法获取task的返回值
+    Any get();
+
+private:
+    Any any_;                       // 存储信号的返回值
+    Semaphore sem_;                 // 线程通信信号量
+    std::shared_ptr<Task> task_;    // 指向对应获取返回值的任务对象
+    std::atomic_bool isValid_;      // 返回值是否有效
 };
 
 // 线程池支持的模式
@@ -127,7 +192,7 @@ public:
     void setTaskQueMaxThreshHold(size_t threshhold);
 
     // 给线程池提交任务
-    void submitTask(std::shared_ptr<Task> sp);
+    Result submitTask(std::shared_ptr<Task> sp);
 
     // 开启线程池
     void start(int initThreadSize = 4);
