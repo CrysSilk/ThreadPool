@@ -68,7 +68,7 @@ private:
 class Semaphore
 {
 public:
-    Semaphore(int limit = 0) : resLimit_()
+    Semaphore(int limit = 0) : resLimit_(limit)
     {}
 
     ~Semaphore() = default;

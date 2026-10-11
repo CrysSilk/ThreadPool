@@ -14,6 +14,11 @@
 > - `std::condition_variable` 的 `wait` 系列函数
 > - C++17 `std::any` 与手写 `Any`
 > - 虚析构函数与 `= default`
+> - 手写信号量 `Semaphore`（`mutex` + `condition_variable`）
+> - 线程池返回值机制：`Task::exec`、`Result`、`submitTask`
+> - `Task` 与 `Result` 的相互引用与生命周期
+> - C++17 保证的复制省略
+> - Master-Slave 线程模型与整数溢出
 
 ---
 
@@ -83,12 +88,9 @@ a.speak();        // 输出 Animal，而不是 Dog
 
 这里发生了：
 
-```text
-Dog 对象
-   │
-   │ 拷贝
-   ↓
-Animal 对象
+```mermaid
+flowchart TD
+    A["Dog 对象"] -->|"拷贝"| B["Animal 对象"]
 ```
 
 `a` 已经不是 `Dog` 对象了，而是一个**独立的 `Animal` 对象**。这就是：
@@ -112,15 +114,14 @@ p->speak();
 
 这里**没有创建新的 `Animal` 对象**，内存布局实际上是：
 
-```text
-        dog
-   ┌───────────────┐
-   │ Animal 部分   │
-   │ Dog 部分      │
-   └───────────────┘
-         ▲
-         │
-       p 指针
+```mermaid
+flowchart TD
+    p["p 指针"] --> dog
+    subgraph dog["dog"]
+        direction TB
+        A["Animal 部分"]
+        D["Dog 部分"]
+    end
 ```
 
 `p` 的静态类型是 `Animal*`，但它实际指向的是 `Dog` 对象。所以调用 `p->speak()` 时，C++ 根据**虚函数机制**（虚表）找到 `Dog::speak()`，这就是多态。
@@ -135,11 +136,9 @@ ref.speak();   // 输出 Dog
 
 `ref` 不是一个新的 `Animal` 对象，它只是 `dog` 的另一个名字：
 
-```text
-Dog dog
-  ▲
-  │
-Animal& ref
+```mermaid
+flowchart BT
+    ref["Animal#amp; ref"] -->|"同一个对象的另一个名字"| dog["Dog dog"]
 ```
 
 所以仍然可以调用 `Dog::speak()`。
@@ -176,15 +175,10 @@ void submitTask(Task* task)
 
 如果用户传入的对象是**局部对象或临时对象**，可以理解成：
 
-```text
-┌─────────────────┐
-│ 局部 / 临时对象 │ ◄──── Task* task
-└─────────────────┘            │
-                               ▼
-                      ┌─────────────────┐
-                      │ TaskQueue       │
-                      │ Task*           │
-                      └─────────────────┘
+```mermaid
+flowchart LR
+    task["Task* task"] -->|"指向"| obj["局部 / 临时对象"]
+    task -->|"push（保存的是地址）"| Q["TaskQueue<br/>Task*"]
 ```
 
 例如：
@@ -201,18 +195,16 @@ void foo(ThreadPool& pool)
 
 对象一旦析构：
 
-```text
-MyTask 对象
-   ↓
-析构
-   ↓
-内存不再代表有效对象
-
-Task*
-   ↓
-仍然保存原来的地址
-   ↓
-悬空指针（Dangling Pointer）
+```mermaid
+flowchart TD
+    subgraph OBJ["对象"]
+        direction TB
+        A["MyTask 对象"] --> B["析构"] --> C["内存不再代表有效对象"]
+    end
+    subgraph PTR["指针"]
+        direction TB
+        P["Task*"] --> Q["仍然保存原来的地址"] --> R["悬空指针（Dangling Pointer）"]
+    end
 ```
 
 之后工作线程执行：
@@ -1066,16 +1058,18 @@ if (int* p = std::any_cast<int>(&a)) {
 
 要实现"一个类型可以接收任意其他类型的数据"，需要解决两个问题：
 
-```text
-任意的其它类型  ──?──►  template（模板，让构造函数可以接收任意类型）
-让一个类型指向其它任意的类型  ──►  基类指针指向派生类对象
+```mermaid
+flowchart LR
+    A["任意的其它类型"] -->|"?"| B["template<br/>（模板，让构造函数可以接收任意类型）"]
+    C["让一个类型指向其它任意的类型"] --> D["基类指针指向派生类对象"]
 ```
 
 即：**基类类型 vs 派生类类型** —— `Any` 内部持有一个 `Base*`（智能指针），而真正存放数据的是派生类模板 `Derive<T>`，利用**多态**（见第一节）把不同类型的数据统一到同一个基类指针之下。
 
-```text
-Any ──► Base*   ◄── Derive<T> : public Base
-                     └── T data_   （真正存放用户数据）
+```mermaid
+flowchart LR
+    Any["Any"] --> Base["Base*"]
+    Derive["Derive#lt;T#gt; : public Base<br/>T data_（真正存放用户数据）"] -->|"继承"| Base
 ```
 
 ### 2. 实现代码
@@ -1152,11 +1146,14 @@ try {
 
 **① 整体结构：一个"壳"，三层嵌套**
 
-```text
-Any
- └── unique_ptr<Base> base_ ───► Derive<int>   （Any a = 42 时）
-                                  ├── Base 部分（只有虚表指针）
-                                  └── int data_ = 42
+```mermaid
+flowchart LR
+    Any["Any"] -->|"unique_ptr#lt;Base#gt; base_"| D
+    subgraph D["Derive#lt;int#gt;（Any a = 42 时）"]
+        direction TB
+        B["Base 部分（只有虚表指针）"]
+        V["int data_ = 42"]
+    end
 ```
 
 - `Any` 本身不是模板，所以任何地方都可以用同一个类型 `Any` 去定义变量、放进容器、作为函数返回值。
@@ -1316,5 +1313,337 @@ private:
 | `= delete` | 显式禁用该函数（见第四节） |
 
 两者都是 C++11 引入的"显式控制特殊成员函数"的语法，常常成对出现在同一个类中（例如 `Any` 里既有 `= default` 也有 `= delete`）。
+
+</details>
+
+---
+
+## 十五、手写信号量：用 mutex + condition_variable 实现 Semaphore
+
+<details>
+<summary>点击展开查看详情</summary>
+
+### 1. 为什么要自己写信号量？
+
+- 项目需要一个"**任务完成了吗**"的通知机制：用户线程调用 `Result::get()` 时，如果任务还没执行完，就要**阻塞等待**；工作线程执行完任务后，再**唤醒**它。
+- C++11 / 14 / 17 的标准库里**没有信号量**（C++20 才加入 `std::counting_semaphore`），所以用已学过的 `mutex` + `condition_variable` 自己实现（`wait` 系列用法见第十节）。
+
+### 2. 实现
+
+```cpp
+class Semaphore
+{
+public:
+    Semaphore(int limit = 0) : resLimit_(limit) {}
+    ~Semaphore() = default;
+
+    // 获取一个信号量资源
+    void wait()
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        // 没有资源就阻塞当前线程，直到 resLimit_ > 0
+        cond_.wait(lock, [&]() -> bool { return resLimit_ > 0; });
+        resLimit_--;
+    }
+
+    // 增加一个信号量资源
+    void post()
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        resLimit_++;
+        cond_.notify_all();
+    }
+
+private:
+    size_t resLimit_;                 // 当前可用的资源数量
+    std::mutex mtx_;
+    std::condition_variable cond_;
+};
+```
+
+### 3. 三个成员各自的职责
+
+| 成员 | 作用 |
+| --- | --- |
+| `resLimit_` | 资源计数：`post` 加一，`wait` 减一；为 0 时 `wait` 阻塞 |
+| `mtx_` | 保护 `resLimit_`：**判断条件**和**修改计数**必须在同一把锁里完成 |
+| `cond_` | 让没有资源的线程睡眠，有资源时被唤醒，避免空转轮询 |
+
+### 4. 关键细节
+
+- **`wait` 带谓词（lambda）**：等价于 `while (!(resLimit_ > 0)) cond_.wait(lock);`，可以防止**虚假唤醒**（线程没人通知也可能醒来）。
+- **`wait` 会在睡眠时释放锁**，醒来后重新加锁，所以 `post` 才能拿到锁去修改计数。
+- **`post` 先改计数、再通知**，改计数在锁内完成，保证被唤醒的线程看到的一定是更新后的值。
+- **`Semaphore` 含有 `mutex` 和 `condition_variable`，它们都不可拷贝、不可移动**，所以 `Semaphore` 也不可拷贝移动，这会连带影响包含它的 `Result`（见第十八节）。
+- 在项目里它被当作**二值信号量**使用：初始为 0，任务完成时 `post` 一次，`get()` 里 `wait` 一次。
+
+### 5. 小结
+
+- 信号量 = **计数器 + 互斥锁 + 条件变量**，本质是"有资源就继续，没资源就睡觉"。
+- 在线程池里，它是"**异步任务结果就绪**"的通知工具。
+
+</details>
+
+---
+
+## 十六、线程池的返回值机制：`Task::exec`、`Result` 与 `submitTask`
+
+<details>
+<summary>点击展开查看详情</summary>
+
+### 1. 要解决的问题
+
+任务在**线程池的工作线程**里执行，而结果要交给**提交任务的线程**。例如把 `1 + ... + 300000` 拆成三段交给三个线程算，主线程要拿到三个结果再合并。这里有三个设计问题：
+
+1. `run()` 的返回值怎么表示**任意类型**？ → 用 `Any`（第十二节）
+2. 结果存在哪里、怎么取？ → 新增 `Result` 类
+3. 任务没算完时用户就调用 `get()` 怎么办？ → 用 `Semaphore` 阻塞（第十五节）
+
+### 2. 整体流程
+
+```mermaid
+sequenceDiagram
+    participant U as 用户线程
+    participant R as Result
+    participant W as 工作线程
+
+    U->>U: submitTask(sp)，任务放入任务队列
+    U->>R: 构造 Result(sp)
+    R->>R: task->setResult(this)，让 task 知道结果该交给谁
+    R-->>U: 返回 Result
+    W->>W: threadFunc 取出任务
+    W->>W: task->exec()
+    W->>R: result_->setVal(run())
+    Note right of R: any_ = 结果，然后 sem_.post()
+    U->>R: res.get()
+    Note over U,R: sem_.wait()：没算完就阻塞，算完被唤醒
+    R-->>U: 返回结果（Any）
+    U->>U: .cast_#lt;ULong#gt;() 转回具体类型
+```
+
+### 3. 本次改动涉及的几处代码
+
+**① `Task::exec`：把 `run()` 的结果送进 `Result`**
+
+```cpp
+void Task::exec()
+{
+    if (result_ != nullptr)
+    {
+        result_->setVal(run());   // 这里发生多态调用
+    }
+}
+```
+
+- 工作线程原来直接调用 `task->run()`，现在改为调用 `exec()`。
+- `exec()` 是**固定流程（非虚函数）**，里面调用的 `run()` 是**虚函数**，会多态地调用到用户重写的版本。用户只管写 `run()`，不用关心结果怎么传，这就是**模板方法**的思路。
+- 注意：`run()` 写在 `if` 里面，所以**没有绑定 `Result` 的任务不会被执行**。
+
+**② `Result::setVal` 与 `Result::get`**
+
+```cpp
+void Result::setVal(Any any)
+{
+    this->any_ = std::move(any);   // Any 不可拷贝，只能 move
+    sem_.post();                   // 结果就绪，增加信号量资源
+}
+
+Any Result::get()
+{
+    if (!isValid_)
+        return "";                 // 提交失败，直接返回空值，不阻塞
+
+    sem_.wait();                   // 任务没执行完，这里阻塞用户线程
+    return std::move(any_);
+}
+```
+
+**③ `submitTask` 的返回值**
+
+```cpp
+Result ThreadPool::submitTask(std::shared_ptr<Task> sp)
+{
+    ...
+    if (!notFull_.wait_for(lock, std::chrono::seconds(1), ...))
+    {
+        return Result(sp, false);   // 队列满，提交失败，isValid_ = false
+    }
+    ...
+    return Result(sp);              // 提交成功
+}
+```
+
+- 提交失败也返回一个 `Result`（`isValid_ = false`），这样调用方写法统一，`get()` 也不会永远阻塞。
+
+### 4. 为什么 `Result` 不能做成 `Task` 的成员再返回？
+
+源码里的注释已经点出：线程执行完 `task` 后，`task` 对象就可能被析构，如果 `Result` 是 `Task` 的成员，它会**跟着一起销毁**，而用户可能这时才调用 `get()`。所以 `Result` 必须是**独立的对象**，由用户持有。
+
+### 5. 为什么读写 `any_` 不需要额外加锁？（happens-before）
+
+- 工作线程：**先写 `any_`，再 `post()`**（`post` 内部解锁）。
+- 用户线程：**先 `wait()`**（`wait` 内部加锁成功），**再读 `any_`**。
+- 同一把 `mtx_` 的"解锁 → 加锁"在两个线程之间建立了 **happens-before** 关系，所以工作线程写入的 `any_`，用户线程一定能看到，不存在数据竞争。
+
+### 6. 使用时的注意点
+
+- **`get()` 只能调用一次**：返回时 `any_` 被 `move` 走，信号量计数也被 `wait` 消耗掉；再调用一次会永远阻塞（计数为 0）。
+- **类型必须与 `run()` 返回的完全一致**：`run()` 里 `return sum;` 的 `sum` 是 `ULong`，取值就必须写 `cast_<ULong>()`，写成 `cast_<int>()` 会抛出 `type is unmatch!`（原因见第十二节）。
+- **`get()` 会阻塞调用线程**：所以应该**先把所有任务都提交完**，再依次 `get()`，否则就变成了串行执行。
+
+```cpp
+Result res1 = pool.submitTask(std::make_shared<MyTask>(1, 100000));
+Result res2 = pool.submitTask(std::make_shared<MyTask>(100001, 200000));
+Result res3 = pool.submitTask(std::make_shared<MyTask>(200001, 300000));
+
+ULong sum1 = res1.get().cast_<ULong>();   // 先提交完，再取结果
+ULong sum2 = res2.get().cast_<ULong>();
+ULong sum3 = res3.get().cast_<ULong>();
+```
+
+### 7. 小结
+
+- `Any` 解决"**返回任意类型**"，`Semaphore` 解决"**等待任务完成**"，`Result` 把两者组合起来，`Task::exec` 负责把结果送进去。
+- `submitTask` 返回 `Result`，用户通过 `get()` 同步拿到异步任务的结果。
+
+</details>
+
+---
+
+## 十七、`Task` 与 `Result` 的相互引用与生命周期
+
+<details>
+<summary>点击展开查看详情</summary>
+
+### 1. 两个类互相持有对方
+
+```cpp
+class Task
+{
+    ...
+private:
+    Result* result_;                 // 裸指针：Result 的生命周期 >>> Task
+};
+
+class Result
+{
+    ...
+private:
+    std::shared_ptr<Task> task_;     // 智能指针：持有对应的任务对象
+};
+```
+
+- `Result` → `Task`：用 `shared_ptr`，只要用户手里还有 `Result`，`Task` 对象就不会被释放。
+- `Task` → `Result`：用**裸指针**，不增加引用计数。
+
+### 2. 为什么 `Task` 里不能也用 `shared_ptr<Result>`？
+
+两边都用 `shared_ptr` 会形成**循环引用**，两个对象的引用计数永远不为 0，造成内存泄漏。这里用"一强一弱"的方式打破循环：`Result` 强引用 `Task`，`Task` 只保存一个不拥有的指针。
+
+> 补充：也可以把 `Task` 里的指针改成 `weak_ptr`，更安全，但本项目采用"约定 `Result` 生命周期更长"的简单方案。
+
+### 3. 裸指针带来的约定与隐患
+
+`Task::result_` 是裸指针，**不会知道 `Result` 是否已经销毁**。因此有一个前提：**在任务执行完之前，`Result` 对象必须一直活着**。
+
+```cpp
+pool.submitTask(std::make_shared<MyTask>(1, 100));   // 返回的临时 Result 立即析构
+// 之后工作线程执行 task->exec()，访问已销毁的 result_  → 悬空指针，未定义行为
+```
+
+所以：
+- **必须用变量接住 `submitTask` 的返回值**，并且保证它活到任务执行完（通常就是一直活到 `get()` 之后）。
+- 这与第二节"裸指针悬空"的本质是同一个问题：**被指向的对象先销毁了，而指针还在使用**。
+
+### 4. `Task` 的析构函数
+
+当前 `Task` 写的是 `~Task() = default;`（**非虚**）。
+
+- 任务通过 `std::make_shared<MyTask>()` 创建，`shared_ptr` 在创建时已经记录了真实类型的删除器，所以不会出问题（见第十三节的补充）。
+- 但作为一个**含有纯虚函数、专门用来被继承的基类**，更稳妥的写法是 `virtual ~Task() = default;`，避免日后换成 `unique_ptr<Task>` 或裸 `new` 时出现隐患。
+
+### 5. 小结
+
+- `Result` 强引用 `Task`、`Task` 弱（裸）引用 `Result`：**避免循环引用**。
+- 代价是必须保证 **`Result` 活得比任务执行更久**。
+
+</details>
+
+---
+
+## 十八、C++17 保证的复制省略（返回不可拷贝、不可移动的对象）
+
+<details>
+<summary>点击展开查看详情</summary>
+
+### 1. 问题场景
+
+```cpp
+Result ThreadPool::submitTask(std::shared_ptr<Task> sp)
+{
+    ...
+    return Result(sp);          // 按值返回一个 Result
+}
+
+Result res1 = pool.submitTask(...);   // 用返回值初始化变量
+```
+
+`Result` 的成员有 `Any`（拷贝被删除）、`Semaphore`（含 `mutex` / `condition_variable`）、`atomic_bool`，所以 `Result` **既不能拷贝，也不能移动**。按传统规则，"按值返回"需要调用拷贝或移动构造，应该编译不过。
+
+### 2. 编译结果对比
+
+| 标准 | 结果 |
+| --- | --- |
+| `-std=c++14` | 报错：`use of deleted function 'Result::Result(const Result&)'` |
+| `-std=c++17` | 通过 |
+
+### 3. 为什么 C++17 可以？
+
+C++17 规定：**用纯右值（prvalue）初始化同类型对象时，必须直接在目标位置构造该对象，不会产生临时对象，也就不需要拷贝 / 移动构造函数**，这叫**强制的复制省略（guaranteed copy elision）**。
+
+- `return Result(sp);` 中的 `Result(sp)` 是纯右值，直接构造在调用者的 `res1` 的位置上。
+- 这同时保证了构造函数里 `task_->setResult(this)` 记录的 `this`，**就是最终那个对象的地址**，否则对象被搬动后 `Task` 里的指针就指错了。
+
+### 3. 注意边界
+
+- 只对**纯右值**保证。如果写成先定义具名局部变量再 `return` 它，那是 NRVO，**不被保证**，在不可拷贝不可移动的类型上依然会编译失败。
+- 本项目因此需要 **C++17**，这与手写 `Any` 的注释"C++17 才有 `std::any`"是同一个标准版本。
+
+### 4. 小结
+
+- 不可拷贝、不可移动的类型也能"按值返回"，前提是**返回的是纯右值**并使用 **C++17**。
+
+</details>
+
+---
+
+## 十九、Master-Slave 线程模型
+
+<details>
+<summary>点击展开查看详情</summary>
+
+### 1. Master-Slave 模型
+
+```mermaid
+flowchart LR
+    M1["Master（主线程）<br/>把大任务拆成若干子任务"]
+    M1 -->|"分配子任务"| S1["Slave（线程池线程）<br/>执行子任务"]
+    M1 -->|"分配子任务"| S2["Slave（线程池线程）<br/>执行子任务"]
+    M1 -->|"分配子任务"| S3["Slave（线程池线程）<br/>执行子任务"]
+    S1 -->|"返回结果"| M2["Master<br/>等待所有 Slave 完成，合并结果并输出"]
+    S2 -->|"返回结果"| M2
+    S3 -->|"返回结果"| M2
+```
+
+对应测试代码：
+
+| 子任务 | 计算区间 | 结果 |
+| --- | --- | --- |
+| `res1` | 1 ~ 100000 | 5000050000 |
+| `res2` | 100001 ~ 200000 | 15000050000 |
+| `res3` | 200001 ~ 300000 | 25000050000 |
+| 合并 | 1 ~ 300000 | **45000150000** |
+
+这个模型能成立，靠的就是线程池的 `Result` 机制：提交任务时拿到 `Result`，之后统一 `get()` 汇总。
 
 </details>
