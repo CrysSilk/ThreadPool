@@ -8,8 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
-
-class Result;
+#include <unordered_map>
 
 // Any类型: 可以接收任意数据的类型
 class Any
@@ -95,6 +94,27 @@ private:
     std::condition_variable cond_;
 };
 
+// 任务返回值的共享状态
+struct ResultState
+{
+    Any any_;           // 保存任务执行结果
+    Semaphore sem_;     // 通知等待结果的线程
+
+    // 保存结果并释放一个信号量资源
+    void setVal(Any any)
+    {
+        any_ = std::move(any);
+        sem_.post();
+    }
+
+    // 等待结果就绪 然后取出结果
+    Any get()
+    {
+        sem_.wait();
+        return std::move(any_);
+    }
+};
+
 // 任务抽象基类
 class Task
 {
@@ -105,33 +125,27 @@ public:
 
     void exec();
 
-    void setResult(Result* res);
+    void setResult(std::shared_ptr<ResultState> state);
 
     // 用户可以自定义任意任务类型，从Task继承，重写run方法，实现自定义任务处理
     virtual Any run() = 0;
 
 private:
-    Result* result_;    // Result对象的生存周期 >>> Task
+    std::shared_ptr<ResultState> resultState_;    // 持有独立的共享状态
 };
 
 // 实现接收提交到线程池的task任务执行完后的返回值类型Result
 class Result
 {
 public:
-    Result(std::shared_ptr<Task> task, bool isValid = true);
+    Result(std::shared_ptr<ResultState> state, bool isValid = true);
 
     ~Result() = default;
 
-    // No1.setVal方法 获取任务执行完的返回值
-    void setVal(Any any);
-
-    // No2.get方法 用户调用这个方法获取task的返回值
     Any get();
 
 private:
-    Any any_;                       // 存储信号的返回值
-    Semaphore sem_;                 // 线程通信信号量
-    std::shared_ptr<Task> task_;    // 指向对应获取返回值的任务对象
+    std::shared_ptr<ResultState> state_;    // 指向对应获取返回值的任务对象
     std::atomic_bool isValid_;      // 返回值是否有效
 };
 
@@ -146,7 +160,7 @@ enum class PoolMode
 class Thread
 {
 public:
-    using ThreadFunc = std::function<void()>;
+    using ThreadFunc = std::function<void(size_t)>;
 
     // 线程构造
     Thread(ThreadFunc func);
@@ -157,8 +171,13 @@ public:
     // 启动线程
     void start();
 
+    // 获取线程id
+    size_t getId() const;
+
 private:
     ThreadFunc func_;
+    static size_t generateId_;
+    size_t threadId_;   // 保存线程id
 };
 
 /*
@@ -191,6 +210,9 @@ public:
     // 设置task任务队列上限阈值
     void setTaskQueMaxThreshHold(size_t threshhold);
 
+    // 设置线程池cached模式下线程阈值
+    void setThreadSizeThreshHold(size_t threshhold);
+
     // 给线程池提交任务
     Result submitTask(std::shared_ptr<Task> sp);
 
@@ -202,11 +224,18 @@ public:
 
 private:
     // 定义线程函数
-    void threadFunc();
+    void threadFunc(size_t threadid);
+
+    // 检查pool的运行状态
+    bool checkRunningState() const;
 
 private:
-    std::vector<std::unique_ptr<Thread>> threads_;      // 线程列表
-    size_t initThreadSize_;             // 初始的线程数量
+    // std::vector<std::unique_ptr<Thread>> threads_;      // 线程列表
+    std::unordered_map<int, std::unique_ptr<Thread>> threads_;  // 线程列表
+    size_t initThreadSize_;                                     // 初始的线程数量
+    std::atomic_uint curThreadSize_;                            // 当前线程池里的线程总数量
+    size_t threadSizeThreshHold_;                               // 线程数量上限阈值
+    std::atomic_uint idleThreadSize_;                           // 空闲线程的数量
 
     std::queue<std::shared_ptr<Task>> taskQue_; // 任务队列
     std::atomic_uint taskSize_;                 // 任务的数量
@@ -216,7 +245,8 @@ private:
     std::condition_variable notFull_;    // 表示任务队列不满
     std::condition_variable notEmpty_;   // 表示任务队列不空   
 
-    PoolMode poolMode_;     // 当前线程池的工作模式
+    PoolMode poolMode_;                 // 当前线程池的工作模式
+    std::atomic_bool isPoolRunning_;    // 表示当前线程池的启动状态
 };
 
 #endif
