@@ -9,6 +9,8 @@
 #include <condition_variable>
 #include <functional>
 #include <unordered_map>
+#include <exception>
+#include <thread>
 
 // Any类型: 可以接收任意数据的类型
 class Any
@@ -99,6 +101,7 @@ struct ResultState
 {
     Any any_;           // 保存任务执行结果
     Semaphore sem_;     // 通知等待结果的线程
+    std::exception_ptr exception_; // 保存任务异常 让 get() 可以重新抛出
 
     // 保存结果并释放一个信号量资源
     void setVal(Any any)
@@ -107,10 +110,20 @@ struct ResultState
         sem_.post();
     }
 
+    // 异常也表示结果已就绪 唤醒等待该任务结果的线程
+    void setException(std::exception_ptr exception)
+    {
+        exception_ = std::move(exception);
+        sem_.post();
+    }
+
     // 等待结果就绪 然后取出结果
     Any get()
     {
         sem_.wait();
+        // 在调用 get() 的线程中重新抛出任务执行时捕获的异常
+        if (exception_ != nullptr)
+            std::rethrow_exception(exception_);
         return std::move(any_);
     }
 };
@@ -139,14 +152,19 @@ class Result
 {
 public:
     Result(std::shared_ptr<ResultState> state, bool isValid = true);
-
     ~Result() = default;
+
+    Result(const Result&) = delete;
+    Result& operator=(const Result&) = delete;
+
+    Result(Result&&) noexcept = default;
+    Result& operator=(Result&&) noexcept = default;
 
     Any get();
 
 private:
     std::shared_ptr<ResultState> state_;    // 指向对应获取返回值的任务对象
-    std::atomic_bool isValid_;      // 返回值是否有效
+    bool isValid_;                  // 返回值是否有效；构造后只读，支持 Result 移动
 };
 
 // 线程池支持的模式
@@ -217,7 +235,7 @@ public:
     Result submitTask(std::shared_ptr<Task> sp);
 
     // 开启线程池
-    void start(int initThreadSize = 4);
+    void start(size_t initThreadSize = std::thread::hardware_concurrency());
 
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
@@ -231,7 +249,7 @@ private:
 
 private:
     // std::vector<std::unique_ptr<Thread>> threads_;      // 线程列表
-    std::unordered_map<int, std::unique_ptr<Thread>> threads_;  // 线程列表
+    std::unordered_map<size_t, std::unique_ptr<Thread>> threads_; // 线程列表
     size_t initThreadSize_;                                     // 初始的线程数量
     std::atomic_uint curThreadSize_;                            // 当前线程池里的线程总数量
     size_t threadSizeThreshHold_;                               // 线程数量上限阈值
@@ -244,6 +262,7 @@ private:
     std::mutex taskQueMtx_;              // 保证任务队列的线程安全
     std::condition_variable notFull_;    // 表示任务队列不满
     std::condition_variable notEmpty_;   // 表示任务队列不空   
+    std::condition_variable exitCond_;   // 等待线程资源全部回收
 
     PoolMode poolMode_;                 // 当前线程池的工作模式
     std::atomic_bool isPoolRunning_;    // 表示当前线程池的启动状态

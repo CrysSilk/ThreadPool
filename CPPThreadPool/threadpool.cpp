@@ -23,7 +23,20 @@ ThreadPool::ThreadPool()
 
 // 线程池析构
 ThreadPool::~ThreadPool()
-{}
+{
+    {
+        // 用任务队列锁同步停止标志与工作线程退出检查。
+        std::lock_guard<std::mutex> lock(taskQueMtx_);
+        isPoolRunning_ = false;
+    }
+
+    // 唤醒等待任务的线程
+    notEmpty_.notify_all();
+
+    // 等待所有工作线程在锁内注销后再析构线程池成员
+    std::unique_lock<std::mutex> lock(taskQueMtx_);
+    exitCond_.wait(lock, [this]() -> bool { return curThreadSize_ == 0; });
+}
 
 // 设置线程池的工作模式
 void ThreadPool::setMode(PoolMode mode)
@@ -67,10 +80,10 @@ Result ThreadPool::submitTask(std::shared_ptr<Task> sp)
     // 线程的通信  等待任务队列有空余  wait   wait_for    wait_until
     // 用户提交任务 最长不能阻塞超过1s 否则判断提交任务失败 返回
     if (!notFull_.wait_for(lock, std::chrono::seconds(1), 
-        [&]() -> bool { return taskQue_.size() < taskQueMaxThreshHold_; }))
+        [&]() -> bool { return taskQue_.size() < taskQueMaxThreshHold_ && isPoolRunning_; }))
     {
-        // 表示notFull_等待1s后 条件仍然没有满足
-        std::cerr << "task queue is full, submit task fail." << std::endl;
+        // 表示notFull_等待1s后/线程池已经关闭
+        std::cerr << "submit task failed: queue full or pool stopped." << std::endl;
         return Result(nullptr, false);
     }
 
@@ -91,20 +104,20 @@ Result ThreadPool::submitTask(std::shared_ptr<Task> sp)
 
         // 创建新的线程对象
         std::unique_ptr<Thread> ptr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this, std::placeholders::_1));
-        int threadId = ptr->getId();
-        threads_.emplace(threadId, std::move(ptr));
-        threads_[threadId]->start();    // 启动线程
+        size_t threadId = ptr->getId();
+        auto threadIt = threads_.emplace(threadId, std::move(ptr)).first;
         // 修改线程相关的线程对象
         curThreadSize_++;
         idleThreadSize_++;
+        threadIt->second->start();      // 启动线程
     }
 
     // 返回任务的Result对象
     return Result(state);
 }
 
-// 开启线程池
-void ThreadPool::start(int initThreadSize)
+// 开启线程池  std::thread::hardware_concurrency(): 返回当前计算机CPU核心数量
+void ThreadPool::start(size_t initThreadSize) 
 {
     // 设置线程池的运行状态
     isPoolRunning_ = true;
@@ -118,16 +131,16 @@ void ThreadPool::start(int initThreadSize)
     {
         // 创建thread线程对象的时候，把线程函数给到thread线程对象
         std::unique_ptr<Thread> ptr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this, std::placeholders::_1));
-        int threadId = ptr->getId();
+        size_t threadId = ptr->getId();
         threads_.emplace(threadId, std::move(ptr));
-        // threads_.emplace_back(std::move(ptr));
     }
 
     // 启动所有线程
-    for (int i = 0; i < initThreadSize_; ++i)
+    std::unique_lock<std::mutex> lock(taskQueMtx_);
+    for (auto& entry : threads_)
     {
-        threads_[i]->start();   // 需要去执行一个线程函数
-        idleThreadSize_++;      // 记录初始空闲线程的数量
+        entry.second->start();
+        ++idleThreadSize_;
     }
 }
 
@@ -139,6 +152,7 @@ void ThreadPool::threadFunc(size_t threadid)
     for (;;)
     {
         std::shared_ptr<Task> task;
+
         {
             // 先获取锁
             std::unique_lock<std::mutex> lock(taskQueMtx_);
@@ -147,40 +161,57 @@ void ThreadPool::threadFunc(size_t threadid)
 
             // Cached模式No3.如何在设定的空闲时间超时情况下 把多余的线程进行回收
             // 结束回收线程 (超过initThreadSize_数量的线程要进行回收)
-            // 当前时间 --- 上一次线程执行的时间 > 10s
-            if (poolMode_ == PoolMode::MODE_CACHED) {
-                // 每一秒钟返回一次     怎么区分: 超时返回？任务待返回
-                while (taskQue_.size() == 0)
-                {
+            while (taskQue_.empty() && isPoolRunning_)
+            {
+                if (poolMode_ == PoolMode::MODE_CACHED) {
+                    // 每一秒钟返回一次     怎么区分: 超时返回？任务待返回
                     /*
                     条件变量超时返回
                     enum class cv_status { no_timeout, timeout };
                     */
-                    if (std::cv_status::timeout == notEmpty_.wait_for(lock, std::chrono::seconds(1)))
+                    const bool awakened = notEmpty_.wait_for(
+                        lock,
+                        std::chrono::seconds(1),
+                        [this]() -> bool { return !taskQue_.empty() || !isPoolRunning_; });
+                    if (!awakened)
                     {
                         auto now = std::chrono::high_resolution_clock::now();
                         auto dur = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime);
-                        if (dur.count() >= THREAD_MAX_IDLE_TIME
+                        if (taskQue_.empty()
+                            && isPoolRunning_
+                            && dur.count() >= THREAD_MAX_IDLE_TIME
                             && curThreadSize_ > initThreadSize_)
                         {
                             /*
                             开始回收当前线程
                             记录线程数量相关变量的值
-                            把线程对象从线程列表容器中删除   没有办法通过threadFunc -> thread对象
-                            threadId -> thread Object -> delete
+                            修改：detach 模式下注销 Thread 包装对象，但不能 join 自己。
                             */
-                            threads_.erase(threadid);   // std::this_thread::getid()
+                            threads_.erase(threadid);
                             curThreadSize_--;
                             idleThreadSize_--;
 
                             std::cout << "threadid: " << std::this_thread::get_id() << " exit!" << std::endl;
+                            // 修改：通知析构函数重新检查活动线程计数。
+                            exitCond_.notify_all();
                             return;
                         }
                     }
+                } else {
+                    // 等待notEmpty条件
+                    notEmpty_.wait(lock, [&]() -> bool { return !taskQue_.empty() || !isPoolRunning_; });
                 }
-            } else {
-                // 等待notEmpty条件
-                notEmpty_.wait(lock, [&]() -> bool { return taskQue_.size() > 0; });
+            }
+
+            // 停止后队列清空时 工作线程在锁内注销并通知析构函数
+            if (taskQue_.empty() && !isPoolRunning_)
+            {
+                threads_.erase(threadid);
+                --curThreadSize_;
+                --idleThreadSize_;
+                std::cout << "threadid: " << std::this_thread::get_id() << " exit!" << std::endl;
+                exitCond_.notify_all();
+                return;
             }
 
             idleThreadSize_--;
@@ -188,7 +219,7 @@ void ThreadPool::threadFunc(size_t threadid)
             // 从任务队列中取一个任务出来
             task = taskQue_.front();
             taskQue_.pop();
-            taskSize_--;
+            --taskSize_;
 
             std::cout << "tid: " << std::this_thread::get_id() << "获取任务成功!" << std::endl;
 
@@ -205,11 +236,27 @@ void ThreadPool::threadFunc(size_t threadid)
         // 当前线程负责执行这个任务
         if (task != nullptr) {
             // task->run();    // 执行任务: 把任务的返回值setVal方法给到Result
-            task->exec();
+            // 修改：兜底捕获任务之外的异常，避免异常逃出 detached 线程入口导致 terminate。
+            try
+            {
+                task->exec();
+            }
+            catch (const std::exception& ex)
+            {
+                std::cerr << "task execution failed: " << ex.what() << std::endl;
+            }
+            catch (...)
+            {
+                std::cerr << "task execution failed with an unknown exception." << std::endl;
+            }
         }
 
         lastTime = std::chrono::high_resolution_clock::now();     // 更新线程执行完任务的时间
-        idleThreadSize_++;
+        // 空闲线程计数与提交任务读取使用同一把锁保护。
+        {
+            std::lock_guard<std::mutex> lock(taskQueMtx_);
+            ++idleThreadSize_;
+        }
     }
 }
 
@@ -234,8 +281,9 @@ Thread::~Thread()
 void Thread::start()
 {
     // 创建一个线程来执行一个线程函数
-    std::thread t(func_, threadId_);  // C++11来说，线程对象t和线程函数func_
-    t.detach();            // 设置分离线程
+    std::thread t(func_, threadId_);
+    // 线程句柄立即分离 线程池通过活动线程计数等待其完成。
+    t.detach();
 }
 
 // 获取线程ID
@@ -251,10 +299,19 @@ Task::Task()
 
 void Task::exec()
 {
-    if (resultState_ != nullptr) {
-        resultState_->setVal(run());  // 这里发生多态调用
-    } else {
-        run();
+    try
+    {
+        Any value = run();
+        if (resultState_ != nullptr)
+            resultState_->setVal(std::move(value));  // 这里发生多态调用
+    }
+    catch (...)
+    {
+        // 让结果状态在任务失败时也就绪 避免 Result::get() 永久等待
+        if (resultState_ != nullptr)
+            resultState_->setException(std::current_exception());
+        else
+            throw;
     }
 }
 
